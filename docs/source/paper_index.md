@@ -1648,6 +1648,22 @@ training_args = GKDConfig(
 )
 ```
 
+### ABKD: Pursuing a Proper Allocation of the Probability Mass in Knowledge Distillation via α-β-Divergence
+
+**📜 Paper**: https://huggingface.co/papers/2505.04560
+
+ABKD uses alpha-beta divergence to control the emphasis on teacher-student probability mismatches and the weighting by student confidence. The paper studies how these choices affect probability-mass allocation and evaluates ABKD on vision and language tasks, including on-policy and mixed-data distillation. Used in TRL via [`DistillationTrainer`] with `loss_type="abkd"`, reusing the trainer's on-policy generation and chunked loss computation.
+
+```python
+from trl import DistillationConfig
+
+training_args = DistillationConfig(
+    loss_type="abkd",
+    abkd_alpha=0.2,  # GPT-2 instruction-distillation setting (Appendix I.1.3)
+    abkd_beta=0.7,
+)
+```
+
 ### MOPD: Multi-Teacher On-Policy Distillation for Capability Integration in LLM Post-Training
 
 **📜 Paper**: https://huggingface.co/papers/2606.30406

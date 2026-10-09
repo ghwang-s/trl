@@ -130,11 +130,20 @@ class DistillationConfig(_BaseConfig):
 
         > Parameters that control the training
 
+        loss_type (`str`, *optional*, defaults to `"jsd"`):
+            Distillation objective: `"jsd"` for generalized Jensen-Shannon divergence or `"abkd"` for alpha-beta
+            divergence.
         beta (`float`, *optional*, defaults to `1.0`):
             Interpolation coefficient for the Generalized Jensen-Shannon Divergence loss. When `0.0`, the loss is the
             forward KL divergence. When `1.0`, the loss is the reverse KL divergence. When `0.5`, it is the standard
             JSD. Unlike GRPO's `beta` (a KL-penalty coefficient against a reference model), here it selects the
-            divergence itself; there is no reference-model KL penalty.
+            divergence itself; there is no reference-model KL penalty. Used when `loss_type="jsd"`.
+        abkd_alpha (`float`, *optional*, defaults to `0.2`):
+            Alpha parameter of ABKD, controlling the emphasis on teacher-student probability mismatches. Used when
+            `loss_type="abkd"`.
+        abkd_beta (`float`, *optional*, defaults to `0.7`):
+            Beta parameter of ABKD, controlling how the updates are weighted by student confidence. Used when
+            `loss_type="abkd"`. This is separate from the JSD mixture coefficient `beta`.
         max_tool_calling_iterations (`int`, *optional*):
             Maximum number of tool-calling turns when training an agent. If `None`, there is no limit and generation
             stops when the model generates a response turn with no tool calls or when the total response length reaches
@@ -351,13 +360,25 @@ class DistillationConfig(_BaseConfig):
     )
 
     # Parameters that control the training
+    loss_type: str = field(
+        default="jsd",
+        metadata={"help": "Distillation objective: 'jsd' for generalized JSD or 'abkd' for alpha-beta divergence."},
+    )
     beta: float = field(
         default=1.0,
         metadata={
             "help": "Interpolation coefficient for the Generalized JSD loss. 0.0 = forward KL, 0.5 = JSD, 1.0 = reverse "
             "KL. Unlike GRPO's `beta` (a KL-penalty coefficient against a reference model), here it selects the "
-            "divergence itself; there is no reference-model KL penalty."
+            "divergence itself; there is no reference-model KL penalty. Used when loss_type='jsd'."
         },
+    )
+    abkd_alpha: float = field(
+        default=0.2,
+        metadata={"help": "ABKD alpha parameter, controlling the emphasis on teacher-student probability mismatches."},
+    )
+    abkd_beta: float = field(
+        default=0.7,
+        metadata={"help": "ABKD beta parameter, controlling student-confidence weighting; separate from JSD's beta."},
     )
     max_tool_calling_iterations: int | None = field(
         default=None,
@@ -392,7 +413,7 @@ class DistillationConfig(_BaseConfig):
     def __post_init__(self):
         super().__post_init__()
 
-        if self.beta < 0.0 or self.beta > 1.0:
+        if self.loss_type == "jsd" and (self.beta < 0.0 or self.beta > 1.0):
             raise ValueError(f"beta must be in [0.0, 1.0], got {self.beta}.")
 
         if self.parallelism_config is not None and (

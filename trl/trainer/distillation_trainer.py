@@ -110,9 +110,12 @@ def _chunked_divergence_loss(
     student_final_logit_softcapping: float | None = None,
     teacher_final_logit_softcapping: float | None = None,
     temperature: float = 1.0,
+    loss_type: str = "jsd",
+    abkd_alpha: float = 0.2,
+    abkd_beta: float = 0.7,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Memory-efficient generalized JSD over student/teacher hidden states and their `lm_head` weights.
+    Memory-efficient distillation loss over student/teacher hidden states and their `lm_head` weights.
 
     The full `lm_head` projections are never materialized: only the valid (unmasked) completion positions are
     projected, on tiles, by [`~kernels.chunked_divergence.ChunkedDivergenceFunction`].
@@ -148,6 +151,12 @@ def _chunked_divergence_loss(
             If set, applies `softcap * tanh(logits / softcap)` to the teacher's logits, after the scale.
         temperature (`float`, *optional*, defaults to `1.0`):
             Softmax temperature applied to both distributions before the divergence, after any scale/softcapping.
+        loss_type (`str`, *optional*, defaults to `"jsd"`):
+            Distillation objective: `"jsd"` or `"abkd"`.
+        abkd_alpha (`float`, *optional*, defaults to `0.2`):
+            Alpha parameter of the alpha-beta divergence, used when `loss_type="abkd"`.
+        abkd_beta (`float`, *optional*, defaults to `0.7`):
+            Beta parameter of the alpha-beta divergence, used when `loss_type="abkd"`.
 
     Returns:
         `tuple[torch.Tensor, torch.Tensor, torch.Tensor]`: scalar loss, sum of per-token student entropy (in nats), and
@@ -191,6 +200,9 @@ def _chunked_divergence_loss(
         student_final_logit_softcapping,
         teacher_logit_scale,
         teacher_final_logit_softcapping,
+        loss_type,
+        abkd_alpha,
+        abkd_beta,
     )
     loss = per_token_divergence.sum()
     entropy_sum = per_token_entropy.sum()
@@ -208,9 +220,9 @@ def _chunked_divergence_loss(
 class DistillationTrainer(_BaseTrainer):
     """
     Trainer for knowledge distillation. The student is trained on-policy — it generates the completions itself — to
-    match the teacher's next-token distribution under a generalized Jensen-Shannon divergence (interpolating forward
-    KL, reverse KL, and JSD via `beta`), as introduced in [On-Policy Distillation of Language
-    Models](https://huggingface.co/papers/2306.13649).
+    match the teacher's next-token distribution, as introduced in [On-Policy Distillation of Language
+    Models](https://huggingface.co/papers/2306.13649). The objective is generalized Jensen-Shannon divergence
+    (interpolating forward KL, reverse KL, and JSD via `beta`) or ABKD's alpha-beta divergence.
 
     Example:
 
@@ -672,7 +684,10 @@ class DistillationTrainer(_BaseTrainer):
             disable_dropout_in_model(self.model)
 
         # Store config values
+        self.loss_type = args.loss_type
         self.beta = args.beta
+        self.abkd_alpha = args.abkd_alpha
+        self.abkd_beta = args.abkd_beta
         self.temperature = args.temperature
         self.top_p = args.top_p
         self.top_k = args.top_k
@@ -1849,6 +1864,9 @@ class DistillationTrainer(_BaseTrainer):
             student_final_logit_softcapping=getattr(student_config, "final_logit_softcapping", None),
             teacher_final_logit_softcapping=getattr(teacher_config, "final_logit_softcapping", None),
             temperature=self.temperature,
+            loss_type=self.loss_type,
+            abkd_alpha=self.abkd_alpha,
+            abkd_beta=self.abkd_beta,
         )
         # Return the raw entropy sum and valid-token count for `compute_loss` to aggregate and log after the forward
         # returns (see there). Detached: the metric is gradient-free.

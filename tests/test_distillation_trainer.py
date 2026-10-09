@@ -58,6 +58,27 @@ if is_peft_available():
     from peft import LoraConfig, PrefixTuningConfig, get_peft_model
 
 
+def _reference_abkd(student_logits, teacher_logits, alpha, beta):
+    """Full-vocabulary AB divergence from the paper's definition and its continuous extensions."""
+    log_p = teacher_logits.double().log_softmax(dim=-1)
+    log_q = student_logits.double().log_softmax(dim=-1)
+    p, q = log_p.exp(), log_q.exp()
+    if alpha == 0.0 and beta == 0.0:
+        per_element = 0.5 * (log_p - log_q).square()
+    elif alpha == 0.0:
+        per_element = (q.pow(beta) * (beta * (log_q - log_p) - 1) + p.pow(beta)) / beta**2
+    elif beta == 0.0:
+        per_element = (p.pow(alpha) * (alpha * (log_p - log_q) - 1) + q.pow(alpha)) / alpha**2
+    elif alpha + beta == 0.0:
+        per_element = (alpha * (log_q - log_p) + (p / q).pow(alpha) - 1) / alpha**2
+    else:
+        total = alpha + beta
+        per_element = (alpha / total * p.pow(total) + beta / total * q.pow(total) - p.pow(alpha) * q.pow(beta)) / (
+            alpha * beta
+        )
+    return per_element.sum(dim=-1)
+
+
 def _reference_chunked_divergence(
     student_hidden,
     teacher_hidden,
@@ -73,9 +94,12 @@ def _reference_chunked_divergence(
     s_softcap=None,
     t_softcap=None,
     temperature=1.0,
+    loss_type="jsd",
+    abkd_alpha=0.2,
+    abkd_beta=0.7,
 ):
-    """Naive full-vocab reference for `_chunked_divergence_loss`: project the whole batch at once (no chunking) and
-    build the JSD straight from the definition, so it shares neither the chunking nor `F.kl_div`'s argument order."""
+    """Full-vocab reference: project the whole batch and build each divergence from its definition, independently
+    of the kernel's chunking and `F.kl_div`'s argument order."""
     # Op order mirrors the loss's chunk body: matmul, + bias, * scale, softcap, / temperature.
     student_logits = student_hidden.float() @ student_w.float().t()
     teacher_logits = teacher_hidden.float() @ teacher_w.float().t()
@@ -93,6 +117,10 @@ def _reference_chunked_divergence(
         teacher_logits = t_softcap * torch.tanh(teacher_logits / t_softcap)
     student_logits = student_logits / temperature
     teacher_logits = teacher_logits / temperature
+    if loss_type == "abkd":
+        per_token = _reference_abkd(student_logits, teacher_logits, abkd_alpha, abkd_beta) * completion_mask
+        denom = completion_mask.sum() if num_items_in_batch is None else num_items_in_batch
+        return (per_token.sum() / denom).float()
     student_log_probs = torch.log_softmax(student_logits, dim=-1)
     teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
     student_probs, teacher_probs = student_log_probs.exp(), teacher_log_probs.exp()
@@ -352,6 +380,101 @@ class TestChunkedDivergenceLoss(TrlTestCase):
         loss.backward()
         assert torch.isfinite(sh.grad).all()
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize(
+        ("alpha", "ab_beta"),
+        [(0.2, 0.7), (0.1, 0.8), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0), (0.0, 0.7), (0.8, 0.0), (0.5, -0.5), (1.5, -0.5)],
+    )
+    @pytest.mark.parametrize("transformed_logits", [False, True])
+    def test_abkd_loss_and_backward(self, dtype, alpha, ab_beta, transformed_logits):
+        # Check the LLM settings and continuous extensions against the full-vocab definition.
+        sh, th, sw, tw, mask = self._inputs()
+        sh, th = sh.to(dtype).requires_grad_(), th.to(dtype).requires_grad_()
+        sw = (sw / sh.size(-1) ** 0.5).to(dtype).requires_grad_()
+        tw = (tw / th.size(-1) ** 0.5).to(dtype).requires_grad_()
+        s_bias = torch.linspace(-0.5, 0.5, sw.size(0), device=torch_device, requires_grad=True)
+        t_bias = torch.linspace(0.5, -0.5, tw.size(0), device=torch_device, requires_grad=True)
+        temperature, s_scale, t_scale = (2.0, 0.7, 1.3) if transformed_logits else (1.0, 1.0, 1.0)
+        s_softcap, t_softcap = (3.0, 2.0) if transformed_logits else (None, None)
+        num_items = mask.sum() * 2 if transformed_logits else None
+        loss, entropy, n_valid = _chunked_divergence_loss(
+            sh,
+            th,
+            sw,
+            tw,
+            mask,
+            beta=0.5,
+            num_items_in_batch=num_items,
+            student_lm_head_bias=s_bias,
+            teacher_lm_head_bias=t_bias,
+            student_logit_scale=s_scale,
+            teacher_logit_scale=t_scale,
+            student_final_logit_softcapping=s_softcap,
+            teacher_final_logit_softcapping=t_softcap,
+            temperature=temperature,
+            loss_type="abkd",
+            abkd_alpha=alpha,
+            abkd_beta=ab_beta,
+        )
+        loss.backward()
+
+        sh_r, sw_r = sh.detach().clone().requires_grad_(), sw.detach().clone().requires_grad_()
+        s_bias_r = s_bias.detach().clone().requires_grad_()
+        expected = _reference_chunked_divergence(
+            sh_r,
+            th.detach(),
+            sw_r,
+            tw.detach(),
+            mask,
+            beta=0.5,
+            num_items_in_batch=num_items,
+            s_bias=s_bias_r,
+            t_bias=t_bias.detach(),
+            s_scale=s_scale,
+            t_scale=t_scale,
+            s_softcap=s_softcap,
+            t_softcap=t_softcap,
+            temperature=temperature,
+            loss_type="abkd",
+            abkd_alpha=alpha,
+            abkd_beta=ab_beta,
+        )
+        expected.backward()
+        torch.testing.assert_close(loss, expected, atol=2e-5, rtol=2e-5)
+        for actual, reference in ((sh.grad, sh_r.grad), (sw.grad, sw_r.grad), (s_bias.grad, s_bias_r.grad)):
+            if dtype == torch.float32:
+                torch.testing.assert_close(actual, reference, atol=2e-5, rtol=2e-5)
+            else:
+                relative_error = (actual.float() - reference.float()).abs().max() / reference.float().abs().max()
+                assert relative_error < 0.02
+        assert torch.count_nonzero(sh.grad[mask == 0]) == 0
+        assert th.grad is None and tw.grad is None and t_bias.grad is None
+        assert not entropy.requires_grad
+        assert n_valid.item() == mask.sum().item()
+
+    @pytest.mark.parametrize("small_chunks", [(4, 2053)], indirect=True)
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize(("alpha", "ab_beta"), [(0.2, 0.7), (0.1, 0.8)])
+    def test_abkd_low_precision_large_logits(self, dtype, alpha, ab_beta):
+        # Skewed distributions contain large log-ratios even when their weighted divergence stays finite.
+        sh, th, sw, tw, mask = self._inputs(B=1, K=3, H=64, V=2053, n_masked=1)
+        sh, th = sh.to(dtype).requires_grad_(), th.to(dtype)
+        sw = (sw * (30.0 / 64**0.5)).to(dtype).requires_grad_()
+        tw = (tw * (30.0 / 64**0.5)).to(dtype)
+        kwargs = {"beta": 0.5, "loss_type": "abkd", "abkd_alpha": alpha, "abkd_beta": ab_beta}
+        loss, _, _ = _chunked_divergence_loss(sh, th, sw, tw, mask, **kwargs)
+        loss.backward()
+        sh_r, sw_r = sh.detach().clone().requires_grad_(), sw.detach().clone().requires_grad_()
+        expected = _reference_chunked_divergence(sh_r, th, sw_r, tw, mask, **kwargs)
+        expected.backward()
+        torch.testing.assert_close(loss, expected, atol=2e-5, rtol=2e-5)
+        for actual, reference in ((sh.grad, sh_r.grad), (sw.grad, sw_r.grad)):
+            if dtype == torch.float32:
+                torch.testing.assert_close(actual, reference, atol=2e-5, rtol=2e-5)
+            else:
+                relative_error = (actual.float() - reference.float()).abs().max() / reference.float().abs().max()
+                assert relative_error < 0.02
+
     def test_fully_masked_batch_keeps_graph(self):
         # With every position masked the loss is 0, but backward must still touch every trainable student param
         # (hidden states, lm_head weight and bias) — otherwise DDP/FSDP synchronization hangs at the all-reduce.
@@ -379,11 +502,13 @@ class TestDistillationTrainer(TrlTestCase):
             train_dataset=dataset,
         )
 
-    def test_train(self):
+    @pytest.mark.parametrize("loss_type", ["jsd", "abkd"])
+    def test_train(self, loss_type):
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = DistillationConfig(
             output_dir=self.tmp_dir,
+            loss_type=loss_type,
             learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
             per_device_train_batch_size=3,  # reduce the batch size to reduce memory usage
             max_completion_length=8,  # reduce the completion length to reduce memory usage
@@ -397,10 +522,13 @@ class TestDistillationTrainer(TrlTestCase):
         )
 
         previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+        previous_teacher_params = {n: param.clone() for n, param in trainer.teacher_model.named_parameters()}
 
         trainer.train()
 
         assert trainer.state.log_history[-1]["train_loss"] is not None
+        for n, param in previous_teacher_params.items():
+            torch.testing.assert_close(trainer.teacher_model.get_parameter(n), param, rtol=0, atol=0)
 
         # The student entropy metric is logged (item 61).
         assert any("entropy" in entry for entry in trainer.state.log_history)
@@ -1413,15 +1541,15 @@ class TestDistillationTrainer(TrlTestCase):
         # Doubling the global count exactly halves the loss (sum / num_items is linear in 1/num_items).
         torch.testing.assert_close(loss_double, loss_mean / 2, rtol=1e-4, atol=1e-6)
 
-    def test_compute_loss_matches_full_logit_reference(self):
-        # The chunked JSD path must produce the same loss as the full-logit JSD it replaced (the handover). This also
-        # checks the wiring: the student stays the student, the teacher the teacher, and only completion positions score.
-        # A non-symmetric `beta` (0.25, not 0.5) is used deliberately so a student/teacher swap would change the loss.
+    @pytest.mark.parametrize("loss_type", ["jsd", "abkd"])
+    def test_compute_loss_matches_full_logit_reference(self, loss_type):
+        # Non-symmetric objectives check the teacher/student direction and completion-token alignment against
+        # full forwards through both real models.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         trainer = DistillationTrainer(
             model="trl-internal-testing/tiny-Qwen3ForCausalLM",
             teacher_model="trl-internal-testing/small-Qwen3ForCausalLM",
-            args=DistillationConfig(output_dir=self.tmp_dir, beta=0.25, report_to="none"),
+            args=DistillationConfig(output_dir=self.tmp_dir, beta=0.25, loss_type=loss_type, report_to="none"),
             train_dataset=dataset,
         )
 
@@ -1440,21 +1568,23 @@ class TestDistillationTrainer(TrlTestCase):
         with torch.no_grad():
             loss = trainer.compute_loss(trainer.model, batch, num_items_in_batch=num_valid)
 
-            # Full-logit reference (the pre-chunking loss): run both models' full forward, take the completion logits,
-            # and compute the generalized JSD over the completion positions, normalized by num_items.
+            # Run both full models and score only the completion positions, normalized by num_items.
             input_ids = torch.cat([batch["prompt_ids"], batch["completion_ids"]], dim=1)
             attention_mask = torch.cat([batch["prompt_mask"], batch["completion_mask"]], dim=1)
             keep = slice(-completion_length - 1, -1)
             s = trainer.model(input_ids=input_ids, attention_mask=attention_mask).logits[:, keep, :]
             t = trainer.teacher_model(input_ids=input_ids, attention_mask=attention_mask).logits[:, keep, :]
-            slp = torch.log_softmax(s.float(), dim=-1)
-            tlp = torch.log_softmax(t.float(), dim=-1)
-            beta_t = torch.tensor(0.25)
-            mixture = torch.logsumexp(torch.stack([slp + torch.log1p(-beta_t), tlp + torch.log(beta_t)]), dim=0)
-            jsd = 0.25 * F.kl_div(mixture, tlp, reduction="none", log_target=True) + 0.75 * F.kl_div(
-                mixture, slp, reduction="none", log_target=True
-            )
-            reference = jsd.sum() / num_valid
+            if loss_type == "abkd":
+                reference = _reference_abkd(s.float(), t.float(), alpha=0.2, beta=0.7).sum().float() / num_valid
+            else:
+                slp = torch.log_softmax(s.float(), dim=-1)
+                tlp = torch.log_softmax(t.float(), dim=-1)
+                beta_t = torch.tensor(0.25)
+                mixture = torch.logsumexp(torch.stack([slp + torch.log1p(-beta_t), tlp + torch.log(beta_t)]), dim=0)
+                jsd = 0.25 * F.kl_div(mixture, tlp, reduction="none", log_target=True) + 0.75 * F.kl_div(
+                    mixture, slp, reduction="none", log_target=True
+                )
+                reference = jsd.sum() / num_valid
 
         torch.testing.assert_close(loss, reference, rtol=1e-4, atol=1e-6)
 

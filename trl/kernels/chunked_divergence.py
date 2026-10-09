@@ -17,6 +17,7 @@ import math
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from ..trainer.utils import maybe_gather_lm_head_ctx
 from .chunked_logprob import _BLOCK_SIZE, _MM_OUT_DTYPE, _addmm_fp32, _transform
@@ -152,6 +153,90 @@ def _jsd_kernel(
 
 
 @triton.jit
+def _scaled_expm1(log_scale, x):
+    # exp(log_scale) * (exp(x) - 1), without overflowing exp(x) before applying its scale.
+    return tl.exp(log_scale + tl.maximum(x, 0.0)) * tl.where(x > 0.0, -libdevice.expm1(-x), libdevice.expm1(x))
+
+
+@triton.jit
+def _abkd_terms(log_pt, log_ps, ALPHA: tl.constexpr, BETA: tl.constexpr):
+    # The paper uses p for the teacher and q for the student. r = dD / d(log q).
+    gap = log_pt - log_ps
+    if ALPHA == 0.0 and BETA == 0.0:
+        loss = 0.5 * gap * gap
+        r = -gap
+    elif ALPHA == 0.0:
+        q_power = tl.exp(BETA * log_ps)
+        loss = (_scaled_expm1(BETA * log_ps, BETA * gap) - BETA * gap * q_power) / (BETA * BETA)
+        r = -q_power * gap
+    elif BETA == 0.0:
+        p_power = tl.exp(ALPHA * log_pt)
+        loss = (_scaled_expm1(ALPHA * log_pt, -ALPHA * gap) + ALPHA * gap * p_power) / (ALPHA * ALPHA)
+        r = -_scaled_expm1(ALPHA * log_ps, ALPHA * gap) / ALPHA
+    elif ALPHA + BETA == 0.0:
+        loss = (libdevice.expm1(ALPHA * gap) - ALPHA * gap) / (ALPHA * ALPHA)
+        r = -libdevice.expm1(ALPHA * gap) / ALPHA
+    else:
+        log_cross = ALPHA * log_pt + BETA * log_ps
+        loss = (_scaled_expm1(log_cross, BETA * gap) / BETA + _scaled_expm1(log_cross, -ALPHA * gap) / ALPHA) / (
+            ALPHA + BETA
+        )
+        r = -_scaled_expm1((ALPHA + BETA) * log_ps, ALPHA * gap) / ALPHA
+    return loss, r
+
+
+@triton.jit
+def _abkd_kernel(
+    s_ptr,
+    s_stride,
+    t_ptr,
+    t_stride,
+    s_log_z_ptr,
+    t_log_z_ptr,
+    loss_ptr,
+    grad_sum_ptr,
+    n_cols,
+    s_scale,
+    s_softcap,
+    t_scale,
+    t_softcap,
+    inv_t,
+    ALPHA: tl.constexpr,
+    BETA: tl.constexpr,
+    S_HAS_SOFTCAP: tl.constexpr,
+    T_HAS_SOFTCAP: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    s_log_z = tl.load(s_log_z_ptr + row)
+    t_log_z = tl.load(t_log_z_ptr + row)
+    loss = tl.load(loss_ptr + row)
+    grad_sum = tl.load(grad_sum_ptr + row)
+    for start in range(0, n_cols, BLOCK_SIZE):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        zs = _transform(
+            tl.load(s_ptr + row * s_stride + offsets, mask=mask, other=0.0).to(tl.float32),
+            s_scale,
+            s_softcap,
+            inv_t,
+            S_HAS_SOFTCAP,
+        )
+        zt = _transform(
+            tl.load(t_ptr + row * t_stride + offsets, mask=mask, other=0.0).to(tl.float32),
+            t_scale,
+            t_softcap,
+            inv_t,
+            T_HAS_SOFTCAP,
+        )
+        per_element, r = _abkd_terms(zt - t_log_z, zs - s_log_z, ALPHA, BETA)
+        loss += tl.sum(tl.where(mask, per_element, 0.0), axis=0)
+        grad_sum += tl.sum(tl.where(mask, r, 0.0), axis=0)
+    tl.store(loss_ptr + row, loss)
+    tl.store(grad_sum_ptr + row, grad_sum)
+
+
+@triton.jit
 def _backward_kernel(
     s_ptr,
     s_stride,
@@ -169,6 +254,8 @@ def _backward_kernel(
     t_softcap,
     inv_t,
     MODE: tl.constexpr,
+    ABKD_ALPHA: tl.constexpr,
+    ABKD_BETA: tl.constexpr,
     S_HAS_SOFTCAP: tl.constexpr,
     T_HAS_SOFTCAP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -203,13 +290,17 @@ def _backward_kernel(
     elif MODE == 1:
         # reverse KL(p_s || p_t), `aux` is the per-token KL
         grad = ps * (log_ps - log_pt - tl.load(aux_ptr + row))
-    else:
+    elif MODE == 2:
         # generalized JSD, `aux` is the per-token KL(p_s || m)
         a = log_ps + tl.log(1 - beta)
         b = log_pt + tl.log(beta)
         top = tl.maximum(a, b)
         log_m = top + tl.log(tl.exp(a - top) + tl.exp(b - top))
         grad = (1 - beta) * ps * (log_ps - log_m - tl.load(aux_ptr + row))
+    else:
+        _, r = _abkd_terms(log_pt, log_ps, ABKD_ALPHA, ABKD_BETA)
+        # Differentiate through the student's softmax: r_k - q_k * sum_j(r_j).
+        grad = r - ps * tl.load(aux_ptr + row)
     grad = grad * tl.load(grad_ptr + row) * inv_t
     if S_HAS_SOFTCAP:
         grad = grad * (1 - th * th)
@@ -240,7 +331,8 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
 
     `beta` selects the divergence: `0.0` is the forward KL(teacher || student), `1.0` the reverse KL(student ||
     teacher), and anything in between the generalized JSD with mixture `(1 - beta) * p_student + beta * p_teacher`. The
-    gradient flows to the student only; the entropy has none.
+    gradient flows to the student only; the entropy has none. `loss_type="abkd"` instead computes the alpha-beta
+    divergence with `abkd_alpha` and `abkd_beta`, including its continuous extensions at zero parameters.
     """
 
     @staticmethod
@@ -258,6 +350,9 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
         student_final_logit_softcapping: float | None = None,
         teacher_logit_scale: float = 1.0,
         teacher_final_logit_softcapping: float | None = None,
+        loss_type: str = "jsd",
+        abkd_alpha: float = 0.2,
+        abkd_beta: float = 0.7,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         ctx.set_materialize_grads(False)
         device = student_hidden.device
@@ -278,11 +373,14 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
 
         s_max, t_max = zeros() - math.inf, zeros() - math.inf
         s_sum, s_x_sum, t_sum, t_weighted_gap, s_weighted_gap = zeros(), zeros(), zeros(), zeros(), zeros()
-        jsd, kl_student = zeros(), zeros()
+        divergence, aux = zeros(), zeros()
         rows = min(N, TOKEN_CHUNK_SIZE)
         s_buf = torch.empty((rows, VOCAB_CHUNK_SIZE), device=device, dtype=torch.float32)
         t_buf = torch.empty((rows, VOCAB_CHUNK_SIZE), device=device, dtype=torch.float32)
-        is_jsd = 0.0 < beta < 1.0
+        is_abkd = loss_type == "abkd"
+        is_jsd = not is_abkd and 0.0 < beta < 1.0
+        divergence_kernel = _abkd_kernel if is_abkd else _jsd_kernel
+        loss_args = {"ALPHA": abkd_alpha, "BETA": abkd_beta} if is_abkd else {"beta": beta}
 
         with (
             maybe_gather_lm_head_ctx(student_weight, student_bias),
@@ -318,39 +416,36 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
                     )
                 s_log_z = s_max[sl] + torch.log(s_sum[sl])
                 t_log_z = t_max[sl] + torch.log(t_sum[sl])
-                if is_jsd:
+                if is_jsd or is_abkd:
                     for start in range(0, vocab, VOCAB_CHUNK_SIZE):
                         end = min(start + VOCAB_CHUNK_SIZE, vocab)
                         s_tile, t_tile = s_buf[:n, : end - start], t_buf[:n, : end - start]
                         _project(s_tile, h_s, student_weight, student_bias, start, end, s_dtype)
                         _project(t_tile, h_t, teacher_weight, teacher_bias, start, end, t_dtype)
-                        _jsd_kernel[(n,)](
+                        divergence_kernel[(n,)](
                             s_tile,
                             s_tile.stride(0),
                             t_tile,
                             t_tile.stride(0),
                             s_log_z,
                             t_log_z,
-                            jsd[sl],
-                            kl_student[sl],
+                            divergence[sl],
+                            aux[sl],
                             end - start,
-                            beta,
                             BLOCK_SIZE=_BLOCK_SIZE,
+                            **loss_args,
                             **kernel_args,
                         )
 
         s_log_z = s_max + torch.log(s_sum)
         t_log_z = t_max + torch.log(t_sum)
         entropy = s_log_z - s_x_sum / s_sum
-        if beta == 0.0:
+        if not is_abkd and beta == 0.0:
             divergence = t_weighted_gap / t_sum - t_log_z + s_log_z
             aux = divergence
-        elif beta == 1.0:
+        elif not is_abkd and beta == 1.0:
             divergence = s_weighted_gap / s_sum - s_log_z + t_log_z
             aux = divergence
-        else:
-            divergence = jsd
-            aux = kl_student
 
         ctx.save_for_backward(
             student_hidden,
@@ -365,7 +460,8 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
         )
         ctx.dtypes = s_dtype, t_dtype
         ctx.beta = beta
-        ctx.mode = 0 if beta == 0.0 else 1 if beta == 1.0 else 2
+        ctx.mode = 3 if is_abkd else 0 if beta == 0.0 else 1 if beta == 1.0 else 2
+        ctx.abkd_alpha, ctx.abkd_beta = abkd_alpha, abkd_beta
         ctx.kernel_args = kernel_args
         ctx.mark_non_differentiable(entropy)
         return divergence, entropy
@@ -388,7 +484,7 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
         N = student_hidden.shape[0]
         grad_hidden = grad_weight = grad_bias = None
         if grad_divergence is None:
-            return (None,) * 12
+            return (None,) * len(ctx.needs_input_grad)
         grad_divergence = grad_divergence.float().contiguous()
         with (
             maybe_gather_lm_head_ctx(student_weight, student_bias),
@@ -428,6 +524,8 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
                         end - start,
                         ctx.beta,
                         MODE=ctx.mode,
+                        ABKD_ALPHA=ctx.abkd_alpha,
+                        ABKD_BETA=ctx.abkd_beta,
                         BLOCK_SIZE=_BLOCK_SIZE,
                         **ctx.kernel_args,
                     )
@@ -443,5 +541,5 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
             grad_hidden.to(student_hidden.dtype) if grad_hidden is not None else None,
             grad_weight.to(student_weight.dtype) if grad_weight is not None else None,
             grad_bias.to(student_bias.dtype) if grad_bias is not None else None,
-            *(None,) * 9,
+            *(None,) * (len(ctx.needs_input_grad) - 3),
         )
