@@ -475,14 +475,17 @@ class TestChunkedDivergenceLoss(TrlTestCase):
                 relative_error = (actual.float() - reference.float()).abs().max() / reference.float().abs().max()
                 assert relative_error < 0.02
 
-    def test_fully_masked_batch_keeps_graph(self):
+    @pytest.mark.parametrize("loss_type", ["jsd", "abkd"])
+    def test_fully_masked_batch_keeps_graph(self, loss_type):
         # With every position masked the loss is 0, but backward must still touch every trainable student param
         # (hidden states, lm_head weight and bias) — otherwise DDP/FSDP synchronization hangs at the all-reduce.
         sh, th, sw, tw, _ = self._inputs()
         sh, sw = sh.clone().requires_grad_(True), sw.clone().requires_grad_(True)
         s_bias = torch.zeros(sw.size(0), device=torch_device, requires_grad=True)
         mask = torch.zeros(sh.size(0), sh.size(1), device=torch_device)
-        loss, _, n_valid = _chunked_divergence_loss(sh, th, sw, tw, mask, beta=0.5, student_lm_head_bias=s_bias)
+        loss, _, n_valid = _chunked_divergence_loss(
+            sh, th, sw, tw, mask, beta=0.5, student_lm_head_bias=s_bias, loss_type=loss_type
+        )
         assert n_valid.item() == 0
         assert torch.isfinite(loss)
         loss.backward()  # must not raise: the graph stays connected through the student hidden states + lm_head
