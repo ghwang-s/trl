@@ -191,11 +191,13 @@ def _abkd_kernel(
     s_stride,
     t_ptr,
     t_stride,
-    s_log_z_ptr,
-    t_log_z_ptr,
+    s_max_ptr,
+    t_max_ptr,
     loss_ptr,
     grad_sum_ptr,
     n_cols,
+    s_sum_ptr,
+    t_sum_ptr,
     s_scale,
     s_softcap,
     t_scale,
@@ -208,8 +210,8 @@ def _abkd_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
-    s_log_z = tl.load(s_log_z_ptr + row)
-    t_log_z = tl.load(t_log_z_ptr + row)
+    s_max, t_max = tl.load(s_max_ptr + row), tl.load(t_max_ptr + row)
+    s_log_sum, t_log_sum = tl.log(tl.load(s_sum_ptr + row)), tl.log(tl.load(t_sum_ptr + row))
     loss = tl.load(loss_ptr + row)
     grad_sum = tl.load(grad_sum_ptr + row)
     for start in range(0, n_cols, BLOCK_SIZE):
@@ -229,7 +231,7 @@ def _abkd_kernel(
             inv_t,
             T_HAS_SOFTCAP,
         )
-        per_element, r = _abkd_terms(zt - t_log_z, zs - s_log_z, ALPHA, BETA)
+        per_element, r = _abkd_terms((zt - t_max) - t_log_sum, (zs - s_max) - s_log_sum, ALPHA, BETA)
         loss += tl.sum(tl.where(mask, per_element, 0.0), axis=0)
         grad_sum += tl.sum(tl.where(mask, r, 0.0), axis=0)
     tl.store(loss_ptr + row, loss)
@@ -242,10 +244,12 @@ def _backward_kernel(
     s_stride,
     t_ptr,
     t_stride,
-    s_log_z_ptr,
-    t_log_z_ptr,
+    s_normalizer_ptr,
+    t_normalizer_ptr,
     aux_ptr,
     grad_ptr,
+    s_sum_ptr,
+    t_sum_ptr,
     n_cols,
     beta,
     s_scale,
@@ -281,8 +285,12 @@ def _backward_kernel(
         inv_t,
         T_HAS_SOFTCAP,
     )
-    log_ps = zs - tl.load(s_log_z_ptr + row)
-    log_pt = zt - tl.load(t_log_z_ptr + row)
+    # ABKD keeps max and sum separate: combining them first loses the small log-sum correction for peaked logits.
+    log_ps = zs - tl.load(s_normalizer_ptr + row)
+    log_pt = zt - tl.load(t_normalizer_ptr + row)
+    if MODE == 3:
+        log_ps -= tl.log(tl.load(s_sum_ptr + row))
+        log_pt -= tl.log(tl.load(t_sum_ptr + row))
     ps = tl.exp(log_ps)
     if MODE == 0:
         # forward KL(p_t || p_s)
@@ -414,9 +422,10 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
                         BLOCK_SIZE=_BLOCK_SIZE,
                         **kernel_args,
                     )
-                s_log_z = s_max[sl] + torch.log(s_sum[sl])
-                t_log_z = t_max[sl] + torch.log(t_sum[sl])
+                s_normalizer = s_max[sl] if is_abkd else s_max[sl] + torch.log(s_sum[sl])
+                t_normalizer = t_max[sl] if is_abkd else t_max[sl] + torch.log(t_sum[sl])
                 if is_jsd or is_abkd:
+                    abkd_stats = {"s_sum_ptr": s_sum[sl], "t_sum_ptr": t_sum[sl]} if is_abkd else {}
                     for start in range(0, vocab, VOCAB_CHUNK_SIZE):
                         end = min(start + VOCAB_CHUNK_SIZE, vocab)
                         s_tile, t_tile = s_buf[:n, : end - start], t_buf[:n, : end - start]
@@ -427,13 +436,14 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
                             s_tile.stride(0),
                             t_tile,
                             t_tile.stride(0),
-                            s_log_z,
-                            t_log_z,
+                            s_normalizer,
+                            t_normalizer,
                             divergence[sl],
                             aux[sl],
                             end - start,
                             BLOCK_SIZE=_BLOCK_SIZE,
                             **loss_args,
+                            **abkd_stats,
                             **kernel_args,
                         )
 
@@ -454,9 +464,11 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
             teacher_hidden,
             teacher_weight,
             teacher_bias,
-            s_log_z,
-            t_log_z,
+            s_max if is_abkd else s_log_z,
+            t_max if is_abkd else t_log_z,
             aux,
+            s_sum if is_abkd else None,
+            t_sum if is_abkd else None,
         )
         ctx.dtypes = s_dtype, t_dtype
         ctx.beta = beta
@@ -475,9 +487,11 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
             teacher_hidden,
             teacher_weight,
             teacher_bias,
-            s_log_z,
-            t_log_z,
+            s_normalizer,
+            t_normalizer,
             aux,
+            s_sum,
+            t_sum,
         ) = ctx.saved_tensors
         s_dtype, t_dtype = ctx.dtypes
         needs_hidden_grad, needs_weight_grad, needs_bias_grad = ctx.needs_input_grad[:3]
@@ -517,10 +531,12 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
                         s_tile.stride(0),
                         t_tile,
                         t_tile.stride(0),
-                        s_log_z[sl],
-                        t_log_z[sl],
+                        s_normalizer[sl],
+                        t_normalizer[sl],
                         aux[sl],
                         grad_divergence[sl],
+                        s_sum[sl] if s_sum is not None else None,
+                        t_sum[sl] if t_sum is not None else None,
                         end - start,
                         ctx.beta,
                         MODE=ctx.mode,
